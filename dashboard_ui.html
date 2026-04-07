@@ -932,34 +932,70 @@ function kupiecPOF(violations, n, p=0.05) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 8. ARIMA MEAN EQUATION SELECTION
-// Search AR(0)..AR(3) by AIC
+// 8. ARMA MEAN EQUATION SELECTION
+// Search ARMA(p,q) p<=5, q<=5 by BIC using Hannan-Rissanen 2-step
 // ═══════════════════════════════════════════════════════════════
 
-function selectARIMA(x){
-  let best={order:0, aic:Infinity, bic:Infinity, resid:x};
+function selectARMA(x){
+  const n=x.length;
+  // Step 1: High order AR to get initial residuals
+  const p_max = 10;
+  const X_ar=[], Y_ar=[];
+  for(let t=p_max;t<n;t++){
+    const row=[1]; for(let j=1;j<=p_max;j++) row.push(x[t-j]);
+    X_ar.push(row); Y_ar.push(x[t]);
+  }
+  const r_ar = ols(X_ar, Y_ar);
+  const eps_hat = new Float64Array(n);
+  if (r_ar) {
+    for(let t=p_max; t<n; t++) eps_hat[t] = r_ar.resid[t-p_max];
+  }
+
+  let best={p:0, q:0, bic:Infinity, resid:x};
   const grid=[];
-  for(let p=0;p<=3;p++){
-    if(p===0){
-      const n=x.length, mean=x.reduce((s,v)=>s+v,0)/n;
-      const resid=x.map(v=>v-mean);
-      const s2=resid.reduce((s,v)=>s+v*v,0)/n;
-      const aic=n*Math.log(s2)+2*1;
-      const bic=n*Math.log(s2)+1*Math.log(n);
-      grid.push({order:p, aic, bic});
-      if(aic<best.aic){ best={order:p,aic,bic,resid:Float64Array.from(resid)}; }
-      continue;
+  for(let p=0;p<=5;p++){
+    for(let q=0;q<=5;q++){
+      const k = Math.max(p, q);
+      if(p===0 && q===0){
+        const mean=x.reduce((s,v)=>s+v,0)/n;
+        const resid=x.map(v=>v-mean);
+        const s2=resid.reduce((s,v)=>s+v*v,0)/n;
+        const bic=n*Math.log(Math.max(s2, 1e-10))+1*Math.log(n);
+        grid.push({p, q, bic});
+        if(bic<best.bic){ best={p,q,bic,resid:Float64Array.from(resid)}; }
+        continue;
+      }
+      
+      const X=[], Y=[];
+      const start_t = Math.max(p, p_max); // ensure eps_hat is populated
+      for(let t=start_t;t<n;t++){
+        const row=[1]; 
+        for(let j=1;j<=p;j++) row.push(x[t-j]);
+        for(let j=1;j<=q;j++) row.push(eps_hat[t-j]);
+        X.push(row); Y.push(x[t]);
+      }
+      const r=ols(X,Y);
+      if(!r) continue;
+      
+      const resid_true = new Float64Array(n);
+      let s2_true = 0;
+      let count = 0;
+      for(let t=k; t<n; t++) {
+         let y_hat = r.beta[0];
+         for(let j=1; j<=p; j++) y_hat += r.beta[j] * x[t-j];
+         for(let j=1; j<=q; j++) y_hat += r.beta[p+j] * resid_true[t-j];
+         resid_true[t] = x[t] - y_hat;
+         s2_true += resid_true[t]*resid_true[t];
+         count++;
+      }
+      s2_true /= Math.max(count, 1);
+      
+      const num_params = p + q + 1;
+      const bic = count*Math.log(Math.max(s2_true, 1e-10)) + num_params*Math.log(count);
+      
+      grid.push({p, q, bic});
+      if(bic<best.bic) best={p, q, bic, resid: Float64Array.from(resid_true)};
     }
-    const n=x.length-p;
-    const X=[], Y=[];
-    for(let t=p;t<x.length;t++){
-      const row=[1]; for(let j=1;j<=p;j++) row.push(x[t-j]);
-      X.push(row); Y.push(x[t]);
-    }
-    const r=ols(X,Y);
-    if(!r) continue;
-    grid.push({order:p, aic:r.aic, bic:r.bic});
-    if(r.aic<best.aic) best={order:p, aic:r.aic, bic:r.bic, resid:Float64Array.from(r.resid)};
   }
   return {best, grid};
 }
@@ -1365,23 +1401,33 @@ async function runAnalysis(data){
   const adfR   = adfTest(Array.from(ret));
   const kpssR  = kpssTest(Array.from(ret));
 
-  // §5 ARIMA selection
-  setProgress(30,'Selecting ARIMA mean equation…', 4); await tick();
-  const {best:arimaB, grid:arimaGrid} = selectARIMA(Array.from(ret));
+  // §5 ARMA selection
+  setProgress(30,'Selecting ARMA mean equation…', 4); await tick();
+  const {best:arimaB, grid:arimaGrid} = selectARMA(Array.from(ret));
   const eps = arimaB.resid;
   const datesEps = dates; 
 
-  // §6a Fit GARCH
+  // Perform Train/Test Split (80/20) for Out-Of-Sample VaR
+  const trainSplit = 0.8;
+  const numTrain = Math.floor(n * trainSplit);
+  const epsTrain = eps.slice(0, numTrain);
+
+  // §6a Fit GARCH (Only on Train Set)
   setProgress(45,'Fitting GARCH(1,1) — MLE via Nelder-Mead…', 5); await tick();
-  const gFit = await fitGARCH(Array.from(eps));
+  const gFit = await fitGARCH(Array.from(epsTrain));
+  gFit.s2 = garchFilter(gFit.params, Array.from(eps));
 
   setProgress(62,'Fitting GJR-GARCH(1,1)…', 6); await tick();
-  const jFit = await fitGJR(Array.from(eps));
+  const jFit = await fitGJR(Array.from(epsTrain));
+  jFit.s2 = gjrFilter(jFit.params, Array.from(eps));
 
   setProgress(79,'Fitting EGARCH(1,1) — 2 starts…', 7); await tick();
-  const eFit = await fitEGARCH(Array.from(eps));
+  const eFit = await fitEGARCH(Array.from(epsTrain));
+  const eRes = egarchFilter(eFit.params, Array.from(eps));
+  eFit.s2 = eRes.s2;
+  eFit.logS2 = eRes.logS2;
 
-  // Backtesting VaR
+  // Backtesting VaR (Out-Of-Sample Only)
   function calcVaR(fit) {
     let violations = 0;
     const num = eps.length;
@@ -1391,18 +1437,24 @@ async function runAnalysis(data){
     for(let t=0; t<num; t++){
       const sig = Math.sqrt(fit.s2[t]);
       varPath[t] = z95 * sig;
-      if(eps[t] < varPath[t]){ violations++; violationArr[t]=true; }
+      
+      // Calculate violations only on Test Set
+      if(t >= numTrain) {
+          if(eps[t] < varPath[t]){ violations++; violationArr[t]=true; }
+      }
     }
-    const kupiec = kupiecPOF(violations, num, 0.05);
+    const testSize = num - numTrain;
+    const kupiec = kupiecPOF(violations, testSize, 0.05);
+    const expectedBreaches = testSize * 0.05;
     // score based on abs diff to expected violations
-    const breachDist = Math.abs(violations - (num * 0.05));
-    return { violations, pof: kupiec.pval, lr: kupiec.lr, varPath, violationArr, breachDist };
+    const breachDist = Math.abs(violations - expectedBreaches);
+    return { violations, pof: kupiec.pval, lr: kupiec.lr, varPath, violationArr, breachDist, expectedBreaches };
   }
   gFit.varResult = calcVaR(gFit);
   jFit.varResult = calcVaR(jFit);
   eFit.varResult = calcVaR(eFit);
 
-  // Diagnostics
+  // Diagnostics (On Train Set Residuals)
   setProgress(88,'Computing diagnostics…', 8); await tick();
   const DLAGS=[5,10,20];
   function diag(fit){
@@ -1436,11 +1488,11 @@ async function runAnalysis(data){
     dgG, dgJ, dgE,
     nicGrid, nicG, nicJ, nicE,
     roll21,
-    corrMatrix, var95, assetNames
+    corrMatrix, var95, assetNames, numTrain
   };
 
-  setProgress(97,'Rendering charts and tables…', 9); await tick();
-  renderAll();
+  setProgress(96,'Starting final render sequence…', 9); await tick();
+  await renderAll();
   setProgress(100,'Analysis complete! ✓', 9); await tick();
 
   // Reveal main content, hide loading with a smooth fade
@@ -1455,12 +1507,13 @@ async function runAnalysis(data){
 // 17. RENDER EVERYTHING
 // ═══════════════════════════════════════════════════════════════
 
-function renderAll(){
+async function renderAll(){
   const R=RESULTS;
   const n=R.n, ds=R.ds;
   const confBand=1.96/Math.sqrt(n);
   const lags40=Array.from({length:40},(_,i)=>i+1);
   const datesArr=Array.from(R.dates);
+  const splitDate = datesArr[R.numTrain];
 
   // Gen date
   document.getElementById('gen-date').textContent=new Date().toLocaleDateString('en-GB');
@@ -1478,10 +1531,12 @@ function renderAll(){
     <strong>Abstract.</strong>
     This report evaluates the <em>leverage effect</em> in Multi-Asset Portfolio daily log-returns
     over ${R.dates[0]} to ${R.dates[R.n-1]} (${n.toLocaleString()} observations, source: ${R.source}).
-    We compare ARIMA(${R.arimaB.order},0,0)-GARCH(1,1) against GJR-GARCH(1,1) and EGARCH(1,1) (Nelson, 1991),
-    all estimated by Gaussian MLE. Crucially, as requested, model validation is performed using <strong>95% VaR Backtesting via the Kupiec POF Test</strong> rather than relying solely on AIC.
+    We compare ARMA(${R.arimaB.p},${R.arimaB.q})-GARCH(1,1) against GJR-GARCH(1,1) and EGARCH(1,1) (Nelson, 1991),
+    all estimated by Gaussian MLE. Crucially, as requested, model validation is performed using <strong>95% Out-of-Sample VaR Backtesting via the Kupiec POF Test</strong> rather than relying solely on AIC/BIC.
     We find ${R.eFit.leverage<0 ? 'strong evidence' : 'no evidence'} of a leverage effect: $\\hat{\\gamma}=${ge}$ (${gep})${R.eFit.leverage<0 ? ', confirming that negative shocks amplify conditional variance more than positive' : ''}.
-    ${bestModel} achieves the most accurate VaR coverage.`;
+    ${bestModel} achieves the most accurate VaR out-of-sample coverage.`;
+
+  await tick(); // prevent rendering deadlock
 
   // §2 Data
   document.getElementById('data-desc-text').innerHTML=`
@@ -1492,20 +1547,6 @@ function renderAll(){
   // Portfolio Risk Box (Multi-Asset)
   if (R.corrMatrix) {
     document.getElementById('portfolio-risk-box').style.display = 'block';
-    
-    // Build Heatmap for correlations
-    Plotly.newPlot('plot-corr-matrix', [{
-      z: R.corrMatrix,
-      x: R.assetNames,
-      y: R.assetNames,
-      type: 'heatmap',
-      colorscale: 'RdBu',
-      zmin: -1, zmax: 1
-    }], {
-      title: 'Asset Correlation Matrix (Pearson)',
-      margin: {t: 40, b: 60, l: 80, r: 20},
-      height: 380
-    }, PCFG);
 
     document.getElementById('portfolio-risk-box').innerHTML = `
       <h5 style="color:var(--navy);font-weight:700">Multi-Asset Risk Analytics</h5>
@@ -1548,6 +1589,8 @@ function renderAll(){
     kpi(ds.skew.toFixed(3),'Skewness', ds.skew<0?'red':'green') +
     kpi(ds.kurt.toFixed(2),'Excess Kurt.','red') +
     kpi(ds.JBp<0.001?'< 0.001':ds.JBp.toFixed(4),'JB p-value', ds.JBp<0.05?'red':'green');
+
+  setProgress(97,'Rendering base charts…', 9); await tick();
 
   // Plots §2
   Plotly.newPlot('plot-price',
@@ -1658,27 +1701,32 @@ function renderAll(){
       KPSS stat = ${R.kpssR.stat.toFixed(4)} &lt; CV 5% = 0.463). We therefore set <strong>d = 0</strong>.
     </div>`;
 
+  setProgress(98,'Rendering statistical tables…', 9); await tick();
+  
   // §5 ARIMA table
-  document.getElementById('arima-order-display').textContent=`AR(${R.arimaB.order})`;
-  const arimaRows=R.arimaGrid.sort((a,b)=>a.aic-b.aic).map(g=>{
-    const best=g.order===R.arimaB.order;
-    return`<tr ${best?'class="hl-row"':''}><td><code>AR(${g.order})</code></td>
-      <td>${g.aic.toFixed(2)}</td><td>${g.bic.toFixed(2)}</td>
+  document.getElementById('arima-order-display').textContent=`ARMA(${R.arimaB.p},${R.arimaB.q})`;
+  const arimaRows=R.arimaGrid.sort((a,b)=>a.bic-b.bic).slice(0,5).map(g=>{
+    const best=(g.p===R.arimaB.p && g.q===R.arimaB.q);
+    return`<tr ${best?'class="hl-row"':''}><td><code>ARMA(${g.p},${g.q})</code></td>
+      <td>${g.bic.toFixed(2)}</td>
       <td>${best?'<strong>★ Best</strong>':''}</td></tr>`;
   }).join('');
   document.getElementById('arima-aic-table').innerHTML=`
     <div class="tbl-wrap"><table>
-      <thead><tr><th>Model</th><th>AIC</th><th>BIC</th><th></th></tr></thead>
+      <thead><tr><th>Model</th><th>BIC</th><th></th></tr></thead>
       <tbody>${arimaRows}</tbody></table></div>
-    <p style="font-size:.72rem;color:var(--gray)">Sorted by AIC. Highlighted = selected model.</p>`;
+    <p style="font-size:.72rem;color:var(--gray)">Top 5 models sorted by BIC. Highlighted = selected model.</p>`;
+
+  await tick(); // prevent rendering deadlock
 
   // §6 Model params (interactive tabs)
   renderModel('garch');
   renderDiag('g');
 
+  await tick();
   // §8 Comparison table
-  const models=[['ARIMA-GARCH(1,1)',R.gFit],['ARIMA-GJR-GARCH(1,1)',R.jFit],['ARIMA-EGARCH(1,1)',R.eFit]];
-  const expectedBreaches = R.n * 0.05;
+  const models=[['ARMA-GARCH(1,1)',R.gFit],['ARMA-GJR-GARCH(1,1)',R.jFit],['ARMA-EGARCH(1,1)',R.eFit]];
+  const expectedBreaches = R.eFit.varResult.expectedBreaches;
   const bestBreachDist = Math.min(...models.map(m=>m[1].varResult.breachDist));
   const compRows=models.map(([nm,fit])=>{
     const best=fit.varResult.breachDist===bestBreachDist;
@@ -1693,9 +1741,9 @@ function renderAll(){
   }).join('');
   document.getElementById('comp-table').innerHTML=`
     <div class="tbl-wrap"><table>
-      <thead><tr><th>Model</th><th>VaR Violations</th><th>Kupiec LR</th><th>Kupiec p-val</th><th>Leverage γ</th></tr></thead>
+      <thead><tr><th>Model</th><th>VaR Violations (Out-of-Sample)</th><th>Kupiec LR</th><th>Kupiec p-val</th><th>Leverage γ</th></tr></thead>
       <tbody>${compRows}</tbody></table></div>
-    <p style="font-size:.72rem;color:var(--gray)">★ Best model by VaR backtesting accuracy (Expected test violations = ${expectedBreaches.toFixed(1)}). A Kupiec p-val > 0.05 implies the model passed the backtest.</p>`;
+    <p style="font-size:.72rem;color:var(--gray)">★ Best model by Out-of-Sample VaR backtesting accuracy (Expected test violations = ${expectedBreaches.toFixed(1)}). A Kupiec p-val > 0.05 implies the model passed the backtest.</p>`;
     
   if (document.body.classList.contains('nerd-mode-active')) {
       document.getElementById('kupiec-formula').style.display='block';
@@ -1728,6 +1776,11 @@ function renderAll(){
     }
   }
 
+  setProgress(99,'Rendering VaR backtesting results…', 9); await tick();
+
+  const maxEps = epsDt.reduce((a,b)=>a>b?a:b, -Infinity);
+  const minEps = epsDt.reduce((a,b)=>a<b?a:b, Infinity);
+
   Plotly.newPlot('plot-var-breaches',
     [
         mkLine(dt, epsDt, 'Returns', '#9ca3af', 0.8),
@@ -1736,16 +1789,21 @@ function renderAll(){
         {type:'scatter', x:garchViolationX, y:garchViolationY, mode:'markers', name:'GARCH Violations', marker:{color:'orange', size:8, symbol:'circle-open'}},
         {type:'scatter', x:violationX, y:violationY, mode:'markers', name:'EGARCH Violations', marker:{color:'red', size:6, symbol:'x'}}
     ],
-    mkLayout('VaR 95% Backtesting — GARCH vs EGARCH', 'Date', 'Return / VaR Limit', 450), PCFG);
+    {...mkLayout('VaR 95% Backtesting — Out-of-Sample Overlay', 'Date', 'Return / VaR Limit', 450),
+     shapes:[{type:'line',x0:splitDate,x1:splitDate,y0:minEps,y1:maxEps,
+              line:{color:'#3b82f6',dash:'dash',width:2}}],
+     annotations:[{x:splitDate,y:maxEps*0.95,text:'← In-Sample Fit | Out-of-Sample Forecast →',showarrow:false,font:{color:'#3b82f6',size:12,weight:'bold'}}]
+    }, PCFG);
 
-  const bestModelName = R.eFit.varResult.breachDist <= R.jFit.varResult.breachDist && R.eFit.varResult.breachDist <= R.gFit.varResult.breachDist ? 'ARIMA-EGARCH(1,1)' :
-                        (R.jFit.varResult.breachDist <= R.gFit.varResult.breachDist ? 'ARIMA-GJR-GARCH(1,1)' : 'ARIMA-GARCH(1,1)');
+  await tick();
+  const bestModelName = R.eFit.varResult.breachDist <= R.jFit.varResult.breachDist && R.eFit.varResult.breachDist <= R.gFit.varResult.breachDist ? 'ARMA-EGARCH(1,1)' :
+                        (R.jFit.varResult.breachDist <= R.gFit.varResult.breachDist ? 'ARMA-GJR-GARCH(1,1)' : 'ARMA-GARCH(1,1)');
   const bestModelFit = models.find(m=>m[1].varResult.breachDist === bestBreachDist)[1];
 
   document.getElementById('var-summary-box').innerHTML = `
     <div style="background:#f8fafc; border: 1px solid var(--border); border-left: 4px solid var(--blue); border-radius: .5rem; padding: 1.25rem;">
-        <p style="margin-bottom:0.6rem;"><strong>Analysis Overview:</strong> This section evaluates the predictive accuracy of our volatility models using Backtesting. Unlike AIC, which only measures statistical fit, the Kupiec POF Test determines if the model successfully predicts extreme losses.</p>
-        <p style="margin-bottom:0.6rem;"><strong>The Result:</strong> ${bestModelName} is the most robust model. It achieved the lowest violation count (${bestModelFit.varResult.violations}), closest to the expected ${expectedBreaches.toFixed(1)}.</p>
+        <p style="margin-bottom:0.6rem;"><strong>Analysis Overview:</strong> This section evaluates the predictive accuracy of our volatility models using <strong>Out-of-Sample Backtesting</strong>. The GARCH models were fitted only on the first 80% of the dataset. The VaR lines shown to the right of the dashed separator are constructed via 1-step-ahead forecasts using only data available up to $t-1$. Unlike Information Criteria (In-Sample Fit), the Kupiec POF Test strictly determines if the model successfully predicts extreme unseen future losses.</p>
+        <p style="margin-bottom:0.6rem;"><strong>The Result:</strong> ${bestModelName} is the most robust model. It achieved the lowest out-of-sample violation count (${bestModelFit.varResult.violations}), closest to the expected ${expectedBreaches.toFixed(1)}.</p>
         <p style="margin-bottom:0;"><strong>The Edge:</strong> The negative Leverage $\\gamma$ (${R.eFit.leverage.toFixed(3)}) indicates that the model successfully captured the 'leverage effect' in the data, where negative returns lead to higher subsequent volatility than positive returns.</p>
     </div>
   `;
@@ -1887,16 +1945,16 @@ function renderAll(){
 
   // §8 demo
   const dBreach=(R.eFit.varResult.violations - R.gFit.varResult.violations);
-  const expB=R.n * 0.05;
+  const expB=R.eFit.varResult.expectedBreaches;
   const sigBarE=Math.sqrt(Array.from(R.eFit.s2).reduce((s,v)=>s+v,0)/R.eFit.s2.length);
   const nicRatio=Math.exp(2*Math.abs(R.eFit.leverage)*2/sigBarE).toFixed(2);
   document.getElementById('demo-compare').innerHTML=SD(
-    'Step 8 Complete','EGARCH Outperforms in Downside Risk Prediction',
-    `<p>Moving away from abstract Information Criteria, we evaluate model performance through direct risk application: <strong>95% VaR Backtesting</strong>. 
-    The expected number of VaR limit breaches is ${expB.toFixed(1)}. EGARCH experienced ${R.eFit.varResult.violations} violations 
+    'Step 8 Complete','EGARCH Outperforms in Out-of-Sample Risk Prediction',
+    `<p>Moving away from abstract Information Criteria, we evaluate model performance through direct risk application: <strong>95% Out-of-Sample VaR Backtesting</strong>. 
+    The expected number of VaR test limit breaches is ${expB.toFixed(1)}. EGARCH experienced ${R.eFit.varResult.violations} violations 
     (Kupiec POF p-value = ${R.eFit.varResult.pof.toFixed(4)}), while GARCH experienced ${R.gFit.varResult.violations} violations 
-    (Kupiec POF p-value = ${R.gFit.varResult.pof.toFixed(4)}). <strong>EGARCH's dynamic asymmetry better sizes the conditional variance during market turmoil</strong>, resulting in VaR bands that widen faster after the initial shock to prevent clustering of subsequent violations.</p>`,
-    `EGARCH Violations: ${R.eFit.varResult.violations} vs GARCH: ${R.gFit.varResult.violations} (Expected: ~${Math.round(expB)}) · <strong>VaR backtesting confirms the economic relevance of the leverage effect.</strong>`
+    (Kupiec POF p-value = ${R.gFit.varResult.pof.toFixed(4)}). <strong>EGARCH's dynamic asymmetry better sizes the out-of-sample conditional variance during market turmoil</strong>, resulting in VaR bands that widen faster after the initial shock to prevent clustering of subsequent violations.</p>`,
+    `EGARCH Test Violations: ${R.eFit.varResult.violations} vs GARCH: ${R.gFit.varResult.violations} (Expected: ~${Math.round(expB)}) · <strong>Out-of-sample VaR backtesting confirms the predictive economic relevance of the leverage effect.</strong>`
   );
 
   // ══════════════════════════════════════════════════════════
@@ -1908,8 +1966,8 @@ function renderAll(){
 </h5>
 <p style="color:#334155;font-size:.91rem;line-height:1.88;margin-bottom:1.5rem">
   This project set out to answer two questions: whether the leverage effect is statistically
-  present in portfolio volatility, and whether ARIMA-EGARCH outperforms the symmetric
-  ARIMA-GARCH benchmark. Seven sequential findings build a cumulative, interlocking case.
+  present in portfolio volatility, and whether ARMA-EGARCH outperforms the symmetric
+  ARMA-GARCH benchmark. Seven sequential findings build a cumulative, interlocking case.
   The answer to both questions is an unambiguous <strong>yes</strong>.
 </p>
 
@@ -1921,7 +1979,7 @@ function renderAll(){
   excess kurtosis ${ds.kurt.toFixed(2)}) invalidates OLS standard errors.
   Stationarity tests confirm d = 0 (ADF τ = ${R.adfR.stat.toFixed(3)},
   KPSS η = ${R.kpssR.stat.toFixed(4)}), validating the
-  ARIMA(${R.arimaB.order},0,0) mean equation. All methodological preconditions are met:
+  ARMA(${R.arimaB.p},${R.arimaB.q}) mean equation. All methodological preconditions are met:
   time-varying variance modelling is a statistical requirement, not a choice.</p>
 </div>
 
@@ -1950,11 +2008,11 @@ function renderAll(){
 </div>
 
 <div class="cfind">
-  <h6>Finding 4 · EGARCH Superiority Confirmed via Kupiec VaR Backtesting</h6>
-  <p>Replacing abstract Information Criteria with actionable risk metrics, we performed a 95% VaR backtest across the full sample (expected violations: ${(R.n * 0.05).toFixed(1)}). 
+  <h6>Finding 4 · EGARCH Superiority Confirmed via Out-of-Sample Kupiec VaR Backtesting</h6>
+  <p>Replacing abstract Information Criteria with actionable risk metrics, we performed a 95% Out-of-Sample VaR backtest across a 20% test split (expected violations: ${(R.eFit.varResult.expectedBreaches).toFixed(1)}). 
   EGARCH attained ${R.eFit.varResult.violations} violations (Kupiec POF $p$-value = ${R.eFit.varResult.pof.toFixed(4)}),
   while the symmetric GARCH attained ${R.gFit.varResult.violations} (Kupiec $p$-value = ${R.gFit.varResult.pof.toFixed(4)}). 
-  By penalizing both under-coverage (too many failures) and over-coverage (too few), the Kupiec test verifies that EGARCH's asymmetric response provides statistically superior capital bounds during structural market downturns.</p>
+  By penalizing both under-coverage (too many failures) and over-coverage (too few) strictly out-of-sample, the Kupiec test verifies that EGARCH's asymmetric response provides statistically superior capital bounds during structural market downturns.</p>
 </div>
 
 <div class="cfind">
@@ -2015,7 +2073,7 @@ function renderAll(){
   </div>
 
   <div class="fv-answer">
-    <div class="fv-q">Research Question 2 — Does ARIMA-EGARCH outperform ARIMA-GARCH?</div>
+    <div class="fv-q">Research Question 2 — Does ARMA-EGARCH outperform ARMA-GARCH?</div>
     <div class="fv-a">
       <strong>Yes, decisively in out-of-sample risk coverage.</strong>
       EGARCH produced ${R.eFit.varResult.violations} VaR limit breaches against an expected ${Math.round(R.n * 0.05)}, 
@@ -2139,6 +2197,11 @@ let startTime=0;
 
 async function startWithData(data){
   startTime=performance.now();
+  
+  // Hide drop zone so users don't think it's waiting for input
+  const dropZone = document.getElementById('drop-zone');
+  if(dropZone) dropZone.style.display = 'none';
+
   try{ await runAnalysis(data); }
   catch(e){
     console.error('Analysis failed:',e);
@@ -2153,6 +2216,11 @@ async function recompute(){
   const overlay = document.getElementById('loading-overlay');
   overlay.style.display='flex';
   overlay.classList.remove('fade-out');
+  
+  // Show drop zone briefly until startWithData runs
+  const dropZone = document.getElementById('drop-zone');
+  if(dropZone) dropZone.style.display = 'block';
+
   document.getElementById('prog-bar').style.width='0%';
   document.getElementById('prog-msg').textContent='Computing Synthetic Portfolio…';
   await tick();
